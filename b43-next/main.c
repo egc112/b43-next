@@ -353,6 +353,22 @@ static struct ieee80211_channel b43_5ghz_acphy_chantable[] = {
 	CHAN5G(157, 0),		CHAN5G(161, 0),
 	CHAN5G(165, 0),
 };
+
+/* The HT-PHY's: the channels radio_2059.c has tuning values for. */
+static struct ieee80211_channel b43_5ghz_htphy_chantable[] = {
+	CHAN5G(36, 0),		CHAN5G(40, 0),
+	CHAN5G(44, 0),		CHAN5G(48, 0),
+	CHAN5G(52, 0),		CHAN5G(56, 0),
+	CHAN5G(60, 0),		CHAN5G(64, 0),
+	CHAN5G(100, 0),		CHAN5G(104, 0),
+	CHAN5G(108, 0),		CHAN5G(112, 0),
+	CHAN5G(116, 0),		CHAN5G(120, 0),
+	CHAN5G(124, 0),		CHAN5G(128, 0),
+	CHAN5G(132, 0),		CHAN5G(136, 0),
+	CHAN5G(140, 0),		CHAN5G(149, 0),
+	CHAN5G(153, 0),		CHAN5G(157, 0),
+	CHAN5G(161, 0),		CHAN5G(165, 0),
+};
 #undef CHAN4G
 #undef CHAN5G
 
@@ -368,6 +384,14 @@ static struct ieee80211_supported_band b43_band_5GHz_nphy_limited = {
 	.band		= NL80211_BAND_5GHZ,
 	.channels	= b43_5ghz_nphy_chantable_limited,
 	.n_channels	= ARRAY_SIZE(b43_5ghz_nphy_chantable_limited),
+	.bitrates	= b43_a_ratetable,
+	.n_bitrates	= b43_a_ratetable_size,
+};
+
+static struct ieee80211_supported_band b43_band_5GHz_htphy = {
+	.band		= NL80211_BAND_5GHZ,
+	.channels	= b43_5ghz_htphy_chantable,
+	.n_channels	= ARRAY_SIZE(b43_5ghz_htphy_chantable),
 	.bitrates	= b43_a_ratetable,
 	.n_bitrates	= b43_a_ratetable_size,
 };
@@ -929,7 +953,7 @@ static void b43_write_mac_bssid_templates(struct b43_wldev *dev)
 		tmp |= (u32) (mac_bssid[i + 3]) << 24;
 		b43_ram_write(dev, 0x20 + i, tmp);
 	}
-	if (b43_nphy_ht_enabled(dev)) {
+	if (b43_ht_enabled(dev)) {
 		b43_ram_write(dev, B43_RAM_BA_TA, get_unaligned_le32(mac));
 		b43_ram_write(dev, B43_RAM_BA_TA + 4,
 			      get_unaligned_le16(mac + 4));
@@ -3304,9 +3328,9 @@ static void b43_request_firmware(struct work_struct *work)
 	goto out;
 
 start_ieee80211:
+	/* mac80211 needs four queues for HT */
 	wl->hw->queues = B43_QOS_QUEUE_NUM;
-	if (!modparam_qos || dev->fw.opensource ||
-	    dev->dev->chip_id == BCMN_CHIP_ID_BCM4331)
+	if (!modparam_qos || dev->fw.opensource)
 		wl->hw->queues = 1;
 
 	err = ieee80211_register_hw(wl->hw);
@@ -4229,7 +4253,7 @@ static void b43_chip_init_mac(struct b43_wldev *dev)
 	/* Probe Response Timeout value */
 	/* FIXME: Default to 0, has to be set by ioctl probably... :-/ */
 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_PRMAXTIME, 0);
-	if (b43_nphy_ht_enabled(dev)) {
+	if (b43_ht_enabled(dev)) {
 		b43_shm_write16(dev, B43_SHM_SHARED,
 				B43_SHM_SH_MIMO_MAXSYM, 0xFFFF);
 		b43_shm_write16(dev, B43_SHM_SHARED,
@@ -5724,6 +5748,14 @@ static int b43_switch_band(struct b43_wldev *dev,
 
 	if (phy->type == B43_PHYTYPE_AC)
 		return b43_ac_switch_band(dev, gmode);
+	/*
+	 * The HT-PHY's tables do not survive the PHY reset above: without
+	 * a full init its tables stay at their reset values on the new band,
+	 * table 9 among them (at 5 GHz an Apple BCM4331 then reports every
+	 * frame about 26 dB weaker).
+	 */
+	if (phy->type == B43_PHYTYPE_HT)
+		phy->do_full_init = true;
 	b43_phy_init(dev);
 
 	return 0;
@@ -7847,9 +7879,9 @@ static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
 /* mac80211 sends a peer only MCS that are in our own RX MCS set, up to the
  * TX stream limit.
  */
-static void b43_ht_set_chains(struct b43_wldev *dev)
+static void b43_ht_set_chains_cap(struct b43_wldev *dev,
+				  struct ieee80211_sta_ht_cap *ht)
 {
-	struct ieee80211_sta_ht_cap *ht = &dev->wl->band_2ghz_ht.ht_cap;
 	unsigned int tx_streams = hweight8(dev->txchain);
 	unsigned int rx_streams = hweight8(dev->rxchain);
 	unsigned int highest, i;
@@ -7878,6 +7910,17 @@ static void b43_ht_set_chains(struct b43_wldev *dev)
 		ht->cap &= ~IEEE80211_HT_CAP_TX_STBC;
 }
 
+/* Both bands with HT: the 2.4 GHz one, and the HT-PHY's 5 GHz one */
+static void b43_ht_set_chains(struct b43_wldev *dev)
+{
+	struct b43_wl *wl = dev->wl;
+
+	if (wl->band_2ghz_ht.ht_cap.ht_supported)
+		b43_ht_set_chains_cap(dev, &wl->band_2ghz_ht.ht_cap);
+	if (wl->band_5ghz_ht.ht_cap.ht_supported)
+		b43_ht_set_chains_cap(dev, &wl->band_5ghz_ht.ht_cap);
+}
+
 /* mac80211 allows this only while the device is stopped. */
 static int b43_op_set_antenna(struct ieee80211_hw *hw, int radio_idx,
 			      u32 tx_ant, u32 rx_ant)
@@ -7891,7 +7934,7 @@ static int b43_op_set_antenna(struct ieee80211_hw *hw, int radio_idx,
 	mutex_lock(&wl->mutex);
 	dev->txchain = tx_ant;
 	dev->rxchain = rx_ant;
-	if (b43_nphy_ht_enabled(dev))
+	if (b43_ht_enabled(dev))
 		b43_ht_set_chains(dev);
 	mutex_unlock(&wl->mutex);
 
@@ -8200,6 +8243,10 @@ static int b43_setup_bands(struct b43_wldev *dev,
 			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
 				&b43_band_5GHz_nphy_limited :
 				&b43_band_5GHz_nphy;
+	} else if (dev->phy.type == B43_PHYTYPE_HT) {
+		if (have_5ghz_phy)
+			hw->wiphy->bands[NL80211_BAND_5GHZ] =
+				&b43_band_5GHz_htphy;
 	} else {
 		if (have_5ghz_phy)
 			hw->wiphy->bands[NL80211_BAND_5GHZ] = &b43_band_5GHz_aphy;
@@ -8232,11 +8279,9 @@ static int b43_setup_bands(struct b43_wldev *dev,
 	/* An HT STA is a QoS STA. The shared legacy band templates stay
 	 * unchanged.
 	 */
-	if (b43_ht_core(dev) && modparam_qos && have_2ghz_phy) {
-		struct ieee80211_supported_band *band = &dev->wl->band_2ghz_ht;
-		struct ieee80211_sta_ht_cap *ht = &band->ht_cap;
+	if (b43_ht_core(dev) && modparam_qos) {
+		struct ieee80211_sta_ht_cap ht_cap = { }, *ht = &ht_cap;
 
-		*band = *hw->wiphy->bands[NL80211_BAND_2GHZ];
 		ht->ht_supported = true;
 		/* Every RX chain stays awake. The HT-PHY: 20 MHz, sending
 		 * BCC only.
@@ -8254,8 +8299,24 @@ static int b43_setup_bands(struct b43_wldev *dev,
 		ht->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
 		ht->ampdu_density = IEEE80211_HT_MPDU_DENSITY_4;
 		ht->mcs.rx_mask[0] = 0xff;
+		if (have_2ghz_phy) {
+			struct ieee80211_supported_band *band =
+				&dev->wl->band_2ghz_ht;
+
+			*band = *hw->wiphy->bands[NL80211_BAND_2GHZ];
+			band->ht_cap = ht_cap;
+			hw->wiphy->bands[NL80211_BAND_2GHZ] = band;
+		}
+		/* The HT-PHY's 5 GHz band, the same as its 2.4 GHz one */
+		if (dev->phy.type == B43_PHYTYPE_HT && have_5ghz_phy) {
+			struct ieee80211_supported_band *band =
+				&dev->wl->band_5ghz_ht;
+
+			*band = *hw->wiphy->bands[NL80211_BAND_5GHZ];
+			band->ht_cap = ht_cap;
+			hw->wiphy->bands[NL80211_BAND_5GHZ] = band;
+		}
 		b43_ht_set_chains(dev);
-		hw->wiphy->bands[NL80211_BAND_2GHZ] = band;
 	}
 	if (b43_ampdu_tx_host(dev)) {
 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
@@ -8457,7 +8518,6 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
 		switch (dev->phy.type) {
 		case B43_PHYTYPE_G:
 		case B43_PHYTYPE_LP:
-		case B43_PHYTYPE_HT:
 			b43warn(wl, "5 GHz band is unsupported on this PHY\n");
 			have_5ghz_phy = false;
 		}

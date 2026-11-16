@@ -21,7 +21,6 @@
  * B43_AMPDU_TX_RR_LIMIT of them the member uses its fallback rate. */
 #define B43_AMPDU_TX_RETRY_LIMIT	6
 #define B43_AMPDU_TX_RR_LIMIT		2
-#define B43_AMPDU_TX_MAX_MPDUS		32
 
 /*
  * The cores whose A-MPDUs b43 builds: the pre-AC ones with HT, as their
@@ -302,7 +301,8 @@ static void b43_ampdu_tx_rates(struct b43_wl *wl, struct ieee80211_txq *txq,
 	ieee80211_get_tx_rates(txq->vif, txq->sta, skb, rates,
 			       wl->hw->max_rates);
 	if (t->retries[b43_ampdu_tx_seq(skb) % B43_AMPDU_TX_WINDOW] >
-	    B43_AMPDU_TX_RR_LIMIT && rates[1].idx >= 0)
+	    B43_AMPDU_TX_RR_LIMIT && rates[1].idx >= 0 &&
+	    (rates[1].flags & IEEE80211_TX_RC_MCS))
 		rates[0] = rates[1];
 }
 
@@ -527,7 +527,7 @@ void b43_ampdu_txstatus(struct b43_wldev *dev,
  * mac80211's block ack sessions. On RX the microcode answers an A-MPDU or
  * a block ack request with a block ack of its own making, from no table a
  * driver fills (the AC: frame code 0x25, at 0x076C on 784), the BCM43227's
- * from the transmitter address in its template RAM
+ * and the BCM4331's from the transmitter address in their template RAM
  * (b43_write_mac_bssid_templates()); mac80211 reorders. On TX the cores of
  * b43_ampdu_tx_host() send A-MPDUs on BE (TIDs 0 and 3) and VI (TIDs 4
  * and 5), whose TX FIFOs b43_txfifo_init_ht() sizes.
@@ -548,7 +548,7 @@ int b43_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 		mutex_lock(&wl->mutex);
 		dev = wl->current_dev;
 		rx = params->action == IEEE80211_AMPDU_RX_START;
-		if (dev && (rx ? b43_nphy_ht_enabled(dev) :
+		if (dev && (rx ? b43_ht_enabled(dev) :
 				 b43_ampdu_tx_host(dev)))
 			ok = b43_status(dev) >= B43_STAT_STARTED &&
 			     vif == wl->vif &&

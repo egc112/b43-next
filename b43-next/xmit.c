@@ -1207,6 +1207,14 @@ static int b43_generate_txhdr_fw4(struct b43_wldev *dev,
 
 	memset(txhdr, 0, sizeof(*txhdr));
 
+	/*
+	 * The members of an A-MPDU need an MCS as their fallback rate too:
+	 * retry at the primary one rather than at a legacy rate, which
+	 * minstrel_ht's CCK group gives at 2.4 GHz.
+	 */
+	if (ampdu && (rates[0].flags & IEEE80211_TX_RC_MCS) &&
+	    !(t_fb->flags & IEEE80211_TX_RC_MCS))
+		t_fb = &rates[0];
 	if (!b43_tx_rate_get(dev, info, &rates[0], &r) ||
 	    !b43_tx_rate_get(dev, info, t_fb, &fb))
 		return -EINVAL;
@@ -1723,8 +1731,17 @@ static const u8 *b43_rx_ht_plcp(struct b43_wldev *dev, const u8 *plcp,
 	return dev->rx_ht_plcp;
 
 invalid:
+	/*
+	 * An MPDU without an HT-SIG that no first MPDU of its PPDU vouches
+	 * for (why the HT-SIG is missing is not known). Its FCS is good, only
+	 * its rate is unknown: it gets the last HT-SIG's, as dropping it loses
+	 * an MPDU the block ack already acknowledged and mac80211's reorder
+	 * buffer waits out every such hole. On a BCM4331 receiving MCS 15
+	 * A-MPDUs with the short guard interval that was 2% of them, and TCP
+	 * fell to 13 Mbit/s.
+	 */
 	dev->rx_ht_valid = false;
-	return NULL;
+	return dev->rx_ht_plcp;
 }
 
 /* The rate of an HT frame from its HT-SIG @p. Returns the MCS. */

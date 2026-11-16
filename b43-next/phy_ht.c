@@ -1024,6 +1024,60 @@ static bool b43_phy_ht_home_changed(struct b43_wldev *dev)
  * captures show it on every 2.4 GHz channel at 20 and 40 MHz. The reads
  * are wl's; b43 has no use for their values yet.
  */
+/*
+ * The RX gain tables of a board without BFL_FEM or BFL_HGPA, per band: tables
+ * 0, 1 and 40 hold the gains of cores 1, 2 and 3, tables 2, 3 and 41 their
+ * gain codes. wl's values on an Apple BCM4331 card (external LNA and PA),
+ * which it writes on every band change; the R6400's (FEM and HGPA boards)
+ * give that card's receiver too little gain, at 5 GHz about 30 dB.
+ */
+static void b43_phy_ht_gain_tables(struct b43_wldev *dev,
+				   enum nl80211_band band)
+{
+	static const u8 gain_tbl[] = { 0, 1, 40 };
+	static const u8 code_tbl[] = { 2, 3, 41 };
+	static const u16 gain[2][3][4] = {
+		{ { 0x10, 0x10 }, { 0x0b, 0x11, 0x15, 0x1a },
+		  { 0xfd, 0x07, 0x07, 0x07 } },
+		{ { 0x0d, 0x0d }, { 0x0e, 0x14, 0x18, 0x1c },
+		  { 0xff, 0x07, 0x0b, 0x0b } },
+	};
+	static const u16 code[2][4] = {
+		{ 0, 1, 1, 1 }, { 0, 1, 2, 2 },
+	};
+	bool ghz5 = band == NL80211_BAND_5GHZ;
+	int core, i;
+
+	for (core = 0; core < ARRAY_SIZE(gain_tbl); core++) {
+		u8 g = gain_tbl[core], c = code_tbl[core];
+
+		for (i = 0; i < 2; i++)
+			b43_httab_write(dev, B43_HTTAB16(g, i),
+					gain[ghz5][0][i]);
+		for (i = 0; i < 4; i++) {
+			b43_httab_write(dev, B43_HTTAB16(g, 0x08 + i),
+					gain[ghz5][1][i]);
+			b43_httab_write(dev, B43_HTTAB16(g, 0x10 + i),
+					gain[ghz5][2][i]);
+			b43_httab_write(dev, B43_HTTAB16(c, 0x10 + i),
+					code[ghz5][i]);
+		}
+		for (i = 0; i <= 0xa; i++) {
+			if (ghz5) {
+				b43_httab_write(dev, B43_HTTAB16(g, 0x20 + i),
+						i < 2 ? 0xfa : 0xfd);
+				b43_httab_write(dev, B43_HTTAB16(c, 0x20 + i),
+						i < 2 ? 1 : 2);
+			} else {
+				b43_httab_write(dev, B43_HTTAB16(g, 0x20 + i),
+						i < 0xa ? 0x00 : 0xfd);
+				b43_httab_write(dev, B43_HTTAB16(c, 0x20 + i),
+						i < 0xa ? 1 : 2);
+			}
+		}
+	}
+}
+
 static void b43_phy_ht_gain_ctl_setup(struct b43_wldev *dev,
 				      struct ieee80211_channel *channel)
 {
@@ -1077,6 +1131,10 @@ static void b43_phy_ht_gain_ctl_setup(struct b43_wldev *dev,
 
 	b43_httab_write_few(dev, B43_HTTAB16(7, 0x106), 3,
 			    0x6136, 0x6136, 0x6136);
+	if (!(dev->dev->bus_sprom->boardflags_lo & (B43_BFL_FEM | B43_BFL_HGPA))) {
+		b43_phy_ht_gain_tables(dev, channel->band);
+		goto lna_done;
+	}
 	for (c = 0; c < 3; c++)
 		b43_httab_write_few(dev, B43_HTTAB16(lna[c], 0x00), 2, 0xd, 0xd);
 	for (c = 0; c < 3; c++)
@@ -1097,6 +1155,7 @@ static void b43_phy_ht_gain_ctl_setup(struct b43_wldev *dev,
 	for (c = 0; c < 3; c++)
 		b43_httab_write_bulk(dev, B43_HTTAB16(lna2[c], 0x20),
 				     ARRAY_SIZE(lna2_20), lna2_20);
+lna_done:
 
 	b43_httab_write_few(dev, B43_HTTAB16(8, 0x08), 3, 0x8e, 0x96, 0x96);
 	b43_httab_write_few(dev, B43_HTTAB16(8, 0x18), 3, 0x8f, 0x9f, 0x9f);
@@ -1432,8 +1491,11 @@ static int b43_phy_ht_op_init(struct b43_wldev *dev)
 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ)
 		b43_phy_ht_bphy_init(dev);
 
+	/* The TX gain table of the band: the PHY init runs on a band switch */
 	b43_httab_write_bulk(dev, B43_HTTAB32(0x1a, 0xc0),
-			B43_HTTAB_1A_C0_LATE_SIZE, b43_httab_0x1a_0xc0_late);
+			B43_HTTAB_1A_C0_LATE_SIZE,
+			b43_current_band(dev->wl) == NL80211_BAND_5GHZ ?
+			b43_httab_0x1a_0xc0_late_5g : b43_httab_0x1a_0xc0_late);
 
 	saved_tx_pwr_ctl = phy_ht->tx_pwr_ctl;
 	b43_phy_ht_tx_power_fix(dev);
@@ -1551,12 +1613,10 @@ static int b43_phy_ht_op_switch_channel(struct b43_wldev *dev,
 	enum nl80211_channel_type channel_type = b43_phy_ht_tune_type(dev);
 	int err;
 
-	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
-		if ((new_channel < 1) || (new_channel > 14))
-			return -EINVAL;
-	} else {
+	/* On 5 GHz, b43_phy_ht_set_channel() rejects untabulated channels */
+	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ &&
+	    (new_channel < 1 || new_channel > 14))
 		return -EINVAL;
-	}
 
 	if (phy_ht->tuned && phy_ht->tuned_channel == channel->hw_value &&
 	    phy_ht->tuned_type == channel_type)
@@ -1670,7 +1730,16 @@ b43_phy_ht_op_recalc_txpower(struct b43_wldev *dev, bool ignore_tssi)
 		b43_ppr_apply_max(ppr, INT_TO_Q52(phy->desired_txpower));
 	b43_ppr_add(ppr, -6);
 	b43_ppr_apply_min(ppr, INT_TO_Q52(8));
-	target = b43_ppr_get_max(ppr);
+	/*
+	 * Where the loop runs (no static TX gain), the weakest rate's: the
+	 * loop holds every frame at the target, and on an Apple BCM4331 64-QAM
+	 * distorts at the strongest rate's. At 5 GHz, channel 112, the target
+	 * 0x46 against 0x36: TCP up 28-35 against 52-57 Mbit/s, down the same.
+	 */
+	if (b43_phy_ht_static_txgain(dev) < 0)
+		target = b43_ppr_get_min(ppr);
+	else
+		target = b43_ppr_get_max(ppr);
 
 	if (phy_ht->tx_pwr_target[0] == target)
 		return B43_TXPWR_RES_DONE;
@@ -1878,11 +1947,14 @@ static void b43_phy_ht_op_adjust_txpower(struct b43_wldev *dev)
 {
 	int i, c;
 
+	/* From the TX power work too, with the MAC running; nests in bss_start */
+	b43_mac_suspend(dev);
 	for (i = 0; i < 3; i++)
 		for (c = 0; c < 3; c++)
 			b43_httab_read(dev, B43_HTTAB8(26 + c, 2));
 	b43_phy_ht_tx_power_ctl_setup(dev);
 	b43_phy_ht_tx_power_ctl(dev, true);
+	b43_mac_enable(dev);
 }
 
 /**************************************************
@@ -1982,11 +2054,18 @@ static void b43_phy_ht_txcal_setup(struct b43_wldev *dev,
 		{ B43_PHY_HT_AFE_C2, B43_PHY_HT_AFE_C2_OVER },
 		{ B43_PHY_HT_AFE_C3, B43_PHY_HT_AFE_C3_OVER },
 	};
+	/*
+	 * The radio's loopback: 0x155, 0x15a, 0x159 and 0x15b differ at
+	 * 5 GHz, and the gain is TX gain index 25 there, 0 at 2.4 GHz
+	 * (wl on an Apple BCM4331, traced on channels 6, 36 and 149; the
+	 * same on both 5 GHz channels).
+	 */
+	bool ghz5 = b43_current_band(dev->wl) == NL80211_BAND_5GHZ;
 	u32 gain[3];
 	int c, i;
 
 	for (c = 0; c < 3; c++)
-		gain[c] = b43_httab_read(dev, B43_HTTAB32(26, 0xc0));
+		gain[c] = b43_httab_read(dev, B43_HTTAB32(26, 0xc0 + (ghz5 ? 25 : 0)));
 
 	sv->classifier = b43_phy_ht_classifier(dev, 0, 0);
 	b43_phy_ht_classifier(dev, B43_PHY_HT_CLASS_CTL_CCK_EN |
@@ -2004,10 +2083,10 @@ static void b43_phy_ht_txcal_setup(struct b43_wldev *dev,
 		b43_radio_write(dev, routing[c] | 0x157, 0x55);
 		b43_radio_write(dev, routing[c] | 0x158, 0);
 		b43_radio_write(dev, routing[c] | 0x15c, 0);
-		b43_radio_write(dev, routing[c] | 0x155, 6);
-		b43_radio_write(dev, routing[c] | 0x15a, 0);
-		b43_radio_write(dev, routing[c] | 0x159, 6);
-		b43_radio_write(dev, routing[c] | 0x15b, 0x31);
+		b43_radio_write(dev, routing[c] | 0x155, ghz5 ? 0x0a : 0x06);
+		b43_radio_write(dev, routing[c] | 0x15a, ghz5 ? 0x31 : 0x00);
+		b43_radio_write(dev, routing[c] | 0x159, ghz5 ? 0x04 : 0x06);
+		b43_radio_write(dev, routing[c] | 0x15b, ghz5 ? 0x00 : 0x31);
 	}
 
 	for (c = 0; c < 3; c++) {
@@ -2017,6 +2096,13 @@ static void b43_phy_ht_txcal_setup(struct b43_wldev *dev,
 		sv->afe_over[c] = b43_phy_read(dev, afe[c][1]);
 		b43_phy_mask(dev, afe[c][0], ~0x0100);
 		b43_phy_mask(dev, afe[c][0], ~0x0400);
+		/*
+		 * The overridden bit 9 as wl has it: wl's AFE value is 0x0fcd,
+		 * b43's 0x00cd. Left clear, the engine returns zeros or
+		 * garbage on an Apple BCM4331, and the LO correction it applies
+		 * ruins every frame.
+		 */
+		b43_phy_set(dev, afe[c][0], 0x0200);
 		b43_phy_set(dev, afe[c][1], 0x0200);
 		b43_phy_set(dev, afe[c][1], 0x0400);
 		sv->t8[c] = b43_httab_read(dev, B43_HTTAB16(8, 3 + c * 0x10));
@@ -2156,6 +2242,10 @@ static void b43_phy_ht_cal_tx_iq_lo(struct b43_wldev *dev)
 		}
 	}
 
+	b43dbg(dev->wl, "HT-PHY TX I/Q LO cal ch %u: %04x/%04x lo %04x, %04x/%04x lo %04x, %04x/%04x lo %04x\n",
+	       dev->phy.channel, coef[0][0], coef[0][1], coef[0][2],
+	       coef[1][0], coef[1][1], coef[1][2],
+	       coef[2][0], coef[2][1], coef[2][2]);
 	for (c = 0; c < 3; c++) {
 		b43_httab_write_bulk(dev, B43_HTTAB16(13, 0x60 + c * 4), 2, coef[c]);
 		b43_httab_write_bulk(dev, B43_HTTAB16(13, 0x70 + c * 4), 2, coef[c]);

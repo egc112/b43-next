@@ -1171,6 +1171,7 @@ struct b43_dmaring *b43_setup_dmaring(struct b43_wldev *dev,
 		goto out;
 
 	ring->nr_slots = nr_slots;
+	ring->ampdu_max_mpdus = B43_AMPDU_TX_MAX_MPDUS;
 
 	for (i = 0; i < ring->nr_slots; i++)
 		ring->meta->skb = B43_DMA_PTR_POISON;
@@ -1958,8 +1959,10 @@ static void dma_tx_unwind(struct b43_dmaring *ring, int old_used_slots)
 /* Frames of an A-MPDU the ring of @queue_prio takes now. */
 unsigned int b43_dma_tx_ampdu_room(struct b43_wldev *dev, u8 queue_prio)
 {
-	return free_slots(select_ring_by_priority(dev, queue_prio)) /
-	       TX_SLOTS_MIN;
+	struct b43_dmaring *ring = select_ring_by_priority(dev, queue_prio);
+
+	return min_t(unsigned int, free_slots(ring) / TX_SLOTS_MIN,
+		     ring->ampdu_max_mpdus);
 }
 
 /* Whether A-MPDUs on the ring of @queue_prio await their TX status. */
@@ -1988,6 +1991,14 @@ unsigned int b43_dma_tx_ampdu(struct b43_wldev *dev, u8 queue_prio,
 		dma_len += skbs[i]->len;
 	/* A preload beyond the frames would wait for the next ones. */
 	ampdu[0].preload = min_t(unsigned int, ring->ampdu_preload, dma_len);
+	/*
+	 * Not on the BCM4331: with a preload its microcode (784) stops serving
+	 * the FIFO after a TX underflow, the A-MPDU's status never comes and
+	 * the queue stalls for good, within seconds of a TCP upload or download
+	 * at 5 GHz. Linux's b43 never wrote the field there.
+	 */
+	if (dev->phy.type == B43_PHYTYPE_HT)
+		ampdu[0].preload = 0;
 	ring->queue_prio = queue_prio;
 	for (i = 0; i < n; i++) {
 		err = dma_tx_fragment(ring, skbs[i], &ampdu[i]);
@@ -2024,6 +2035,37 @@ static void dma_ampdu_underflow(struct b43_wldev *dev,
 	ring->ampdu_preload = min(ring->ampdu_preload +
 				  B43_AMPDU_TX_PRELOAD_STEP,
 				  B43_AMPDU_TX_MAX_PRELOAD);
+}
+
+/*
+ * The BCM4331 takes no preload (b43_dma_tx_ampdu()): there the A-MPDUs a
+ * TX FIFO underflow cuts short get fewer MPDUs instead, as brcmsmac lowers
+ * them per rate once preloading is not enough. Its DMA falls behind on
+ * many small MPDUs, two descriptors and a TX header each: the TCP ACKs a
+ * station sends at MCS 15 while it receives at full rate went out 32 to
+ * an A-MPDU, 1.4% of those underflowed, and none of 16 or fewer did; with
+ * at most 24 none did. Lower the limit below each A-MPDU that underflows,
+ * not under B43_AMPDU_TX_MIN_MPDUS, and raise it by one after every
+ * B43_AMPDU_TX_RECOVER A-MPDUs without one.
+ */
+static void b43_ampdu_tx_mpdus_adjust(struct b43_dmaring *ring,
+				      bool underflow, unsigned int n)
+{
+	if (underflow) {
+		if (n > B43_AMPDU_TX_MIN_MPDUS + 4)
+			ring->ampdu_max_mpdus = min_t(unsigned int,
+						      ring->ampdu_max_mpdus,
+						      n - 4);
+		else
+			ring->ampdu_max_mpdus = B43_AMPDU_TX_MIN_MPDUS;
+		ring->ampdu_clean = 0;
+		return;
+	}
+	if (ring->ampdu_max_mpdus < B43_AMPDU_TX_MAX_MPDUS &&
+	    ++ring->ampdu_clean >= B43_AMPDU_TX_RECOVER) {
+		ring->ampdu_max_mpdus++;
+		ring->ampdu_clean = 0;
+	}
 }
 
 /*
@@ -2098,6 +2140,9 @@ bool b43_dma_ampdu_complete(struct b43_wldev *dev,
 	}
 	if (ring->ampdu_pending)
 		ring->ampdu_pending--;
+	if (dev->phy.type == B43_PHYTYPE_HT)
+		b43_ampdu_tx_mpdus_adjust(ring,
+				status->supp_reason == B43_TXST_SUPP_PREV, n);
 #ifdef CONFIG_B43_NEXT_DEBUG
 	ring->nr_succeed_tx_packets += acked;
 	ring->nr_failed_tx_packets += n - acked;
